@@ -1,0 +1,1193 @@
+#!/usr/bin/env python3
+"""
+cf-dev-bootstrap - Codeforward local developer environment manager
+
+Key features:
+- Odoo sources via bare clones + worktrees; fetch with refspec; hard reset worktrees to origin/<branch>
+- Customer repo clone + submodules init (--init --recursive)
+- uv venv + deps
+- Odoo conf generation with additional optional addon paths
+- Demo data is controlled via odoo.conf:
+    without_demo = False   (install demo data)
+    without_demo = all     (no demo data)
+  No --with-demo/--without-demo flags are passed to odoo-bin.
+- PyCharm .run configurations generated after venv creation
+- Optional DB install with:
+  - DB existence check + prompt to drop & recreate BEFORE heavy work (clone/install)
+- Reduced prompts: "Use default configuration?" first, otherwise ask all db/admin params
+- Uses '--no-http' when installing using odoo-bin
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import textwrap
+import time
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import click
+
+# ----------------------------- constants -----------------------------
+
+DEFAULT_ODOO_VERSIONS = ["19.0", "18.0", "17.0"]
+
+ODOO_COMM_GIT = "git@github.com:odoo/odoo.git"
+ODOO_ENT_GIT = "git@github.com:odoo/enterprise.git"
+
+DEFAULT_DB_HOST = "localhost"
+DEFAULT_DB_PORT = "5432"
+DEFAULT_DB_USER = "odoo"
+DEFAULT_DB_PASSWORD = "odoo"
+DEFAULT_ADMIN_PASSWD = "admin"
+
+DEFAULT_INSTALL_MODULE = "xx_all"
+
+# Optional customer addon subfolders (included only if they exist)
+CUSTOMER_ADDON_SUBFOLDERS = [
+    "external",
+    "external/oca",
+    "external/oca_pull",
+    "external/partners",
+]
+
+ASSET_BASE_URL = os.environ.get(
+    "CF_DEV_BOOTSTRAP_ASSET_BASE_URL",
+    "https://raw.githubusercontent.com/codeforward-bv/cf-dev-bootstrap/main",
+)
+
+ASSET_DIR = Path(
+    os.environ.get(
+        "CF_DEV_BOOTSTRAP_ASSET_DIR",
+        str(Path.home() / ".local" / "share" / "cf-dev-bootstrap"),
+    )
+)
+
+# Critical: force remote tracking branches to be populated
+GIT_ORIGIN_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+
+
+# ------------------------------ models -------------------------------
+
+@dataclass
+class Paths:
+    root: Path
+    script_dir: Path
+    odoo_dir: Path
+    odoo_comm_dir: Path
+    odoo_ent_dir: Path
+    comm_bare_git: Path
+    ent_bare_git: Path
+    mapping_file: Path
+    config_dir: Path
+
+
+@dataclass
+class SetupPlan:
+    repo_url: str
+
+    repo_dir: Optional[Path]
+    odoo_major: Optional[str]
+    python_version: Optional[str]
+    odoo_versions_to_ensure: List[str]
+    db_name: str  # derived early from repo url (repo name)
+
+    # DB/config settings (collected before clone/install)
+    use_default_config: bool
+    db_host: str
+    db_port: str
+    db_user: str
+    db_password: str
+    admin_passwd: str
+
+    do_db: bool
+    with_demo: bool
+    module_to_install: str
+
+    # DB recreate decision (made before heavy work)
+    recreate_db: bool
+
+
+# ------------------------------ helpers ------------------------------
+
+class CfDevError(RuntimeError):
+    pass
+
+
+def info(msg: str) -> None:
+    click.echo(f"INFO: {msg}")
+
+
+def warn(msg: str) -> None:
+    click.echo(f"WARN: {msg}", err=True)
+
+
+def die(msg: str) -> None:
+    raise CfDevError(msg)
+
+
+def which(cmd: str) -> Optional[str]:
+    import shutil
+    return shutil.which(cmd)
+
+
+def require_cmd(cmd: str) -> None:
+    if which(cmd) is None:
+        die(f"Missing required command '{cmd}'. Please install it and retry.")
+
+
+def pretty_cmd(args: List[str]) -> str:
+    return " ".join(shlex.quote(a) for a in args)
+
+
+def run(
+    args: List[str],
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+    check: bool = True,
+    capture: bool = False,
+    retries: int = 0,
+    retry_backoff_s: float = 0.8,
+    retry_on: Tuple[int, ...] = (128, 1),
+) -> subprocess.CompletedProcess:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if capture:
+                cp = subprocess.run(
+                    args,
+                    cwd=str(cwd) if cwd else None,
+                    env=env,
+                    check=check,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                cp = subprocess.run(
+                    args,
+                    cwd=str(cwd) if cwd else None,
+                    env=env,
+                    check=check,
+                )
+            return cp
+        except subprocess.CalledProcessError as e:
+            rc = e.returncode
+            if attempt <= retries and rc in retry_on:
+                sleep_s = retry_backoff_s * (2 ** (attempt - 1))
+                warn(f"Command failed (rc={rc}), retrying in {sleep_s:.1f}s: {pretty_cmd(args)}")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+
+def prompt_str(msg: str, default: Optional[str] = None) -> str:
+    if default is None:
+        return click.prompt(msg, type=str, default="", show_default=False).strip()
+    return click.prompt(msg, type=str, default=default, show_default=True).strip()
+
+
+def prompt_yes_no(msg: str, default_no: bool = True) -> bool:
+    return click.confirm(msg, default=not default_no, show_default=True)
+
+
+def ensure_paths() -> Paths:
+    root = Path.cwd()
+    script_dir = Path(__file__).resolve().parent
+
+    odoo_dir = root / "odoo"
+    odoo_comm_dir = odoo_dir / "odoo"
+    odoo_ent_dir = odoo_dir / "enterprise"
+
+    comm_bare_git = odoo_comm_dir / ".git"
+    ent_bare_git = odoo_ent_dir / ".git"
+
+    mapping_file = ASSET_DIR / "mappings" / "odoo-python.json"
+    config_dir = ASSET_DIR / "config"
+
+    return Paths(
+        root=root,
+        script_dir=script_dir,
+        odoo_dir=odoo_dir,
+        odoo_comm_dir=odoo_comm_dir,
+        odoo_ent_dir=odoo_ent_dir,
+        comm_bare_git=comm_bare_git,
+        ent_bare_git=ent_bare_git,
+        mapping_file=mapping_file,
+        config_dir=config_dir,
+    )
+
+
+# ------------------------- repo name derivation -----------------------
+
+def derive_repo_subpath_from_url(url: str) -> Path:
+    """
+    Examples:
+      git@github.com:codeforward-bv/codeforward-odoo.git -> codeforward-bv/codeforward-odoo
+      https://github.com/codeforward-bv/codeforward-odoo.git -> codeforward-bv/codeforward-odoo
+    """
+    url = url.strip()
+    m = re.search(r"github\.com[:/](.+?)(?:\.git)?$", url)
+    if m:
+        return Path(m.group(1))
+
+    parts = [p for p in re.split(r"[/:]", url) if p]
+    if len(parts) >= 2:
+        org = parts[-2]
+        repo = parts[-1].replace(".git", "")
+        return Path(org) / repo
+    return Path("customer") / "repo"
+
+
+def derive_db_name_from_repo_url(repo_url: str) -> str:
+    return derive_repo_subpath_from_url(repo_url).name
+
+
+# -------------------------- assets (download/cache) -------------------
+
+def download_file(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    info(f"Downloading asset: {url} -> {dest}")
+    try:
+        with urllib.request.urlopen(url) as resp:
+            data = resp.read()
+        dest.write_bytes(data)
+    except Exception as e:
+        die(f"Failed to download asset from {url}: {e}")
+
+
+def ensure_mapping_file(paths: Paths) -> None:
+    if paths.mapping_file.exists():
+        return
+    url = f"{ASSET_BASE_URL}/mappings/odoo-python.json"
+    download_file(url, paths.mapping_file)
+
+
+def ensure_config_template(paths: Paths, odoo_major: str) -> None:
+    tmpl = paths.config_dir / odoo_major / "odoo.conf.tmpl"
+    if tmpl.exists():
+        return
+    url = f"{ASSET_BASE_URL}/config/{odoo_major}/odoo.conf.tmpl"
+    download_file(url, tmpl)
+
+
+def ensure_assets(paths: Paths, odoo_majors: List[str]) -> None:
+    ensure_mapping_file(paths)
+    for v in odoo_majors:
+        ensure_config_template(paths, v)
+
+
+# -------------------------- mapping + detection ----------------------
+
+def load_python_mapping(mapping_file: Path) -> Dict[str, str]:
+    if not mapping_file.exists():
+        die(f"Mapping file not found: {mapping_file}")
+    try:
+        return json.loads(mapping_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        die(f"Failed to parse mapping file {mapping_file}: {e}")
+
+
+def detect_odoo_version(repo_dir: Path) -> str:
+    copier = repo_dir / ".copier-answers.yml"
+    if copier.exists():
+        txt = copier.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r'(?m)^\s*odoo_version\s*:\s*["\']?([0-9]{2}\.0)["\']?\s*$', txt)
+        if m:
+            return m.group(1)
+
+    manifests = list(repo_dir.rglob("__manifest__.py"))
+    for mf in manifests:
+        try:
+            major = extract_major_from_manifest(mf)
+            if major:
+                return major
+        except Exception:
+            continue
+
+    die(f"Could not detect Odoo version in repo: {repo_dir}")
+
+
+def extract_major_from_manifest(manifest_path: Path) -> Optional[str]:
+    src = manifest_path.read_text(encoding="utf-8", errors="ignore")
+    node = ast.parse(src)
+    for n in ast.walk(node):
+        if isinstance(n, ast.Dict):
+            keys: List[Optional[str]] = []
+            for k in n.keys:
+                if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    keys.append(k.value)
+                else:
+                    keys.append(None)
+            if "version" in keys:
+                idx = keys.index("version")
+                v = n.values[idx]
+                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                    m = re.match(r"^([0-9]{2}\.0)\.", v.value)
+                    if m:
+                        return m.group(1)
+    return None
+
+
+def map_python_version(odoo_major: str, mapping: Dict[str, str]) -> str:
+    py = mapping.get(odoo_major, "").strip()
+    if not py:
+        die(f"No Python mapping found for Odoo {odoo_major} in mappings/odoo-python.json")
+    return py
+
+
+# ------------------------- git + worktrees (Odoo) ---------------------------
+
+def ensure_bare_clone(repo_url: str, bare_git_dir: Path, retries: int = 1) -> None:
+    bare_git_dir.parent.mkdir(parents=True, exist_ok=True)
+    if bare_git_dir.exists():
+        return
+    info(f"Creating bare clone: {repo_url} -> {bare_git_dir}")
+    run(["git", "clone", "--bare", repo_url, str(bare_git_dir)], retries=retries)
+
+
+def fetch_bare(bare_git_dir: Path) -> None:
+    info(f"Fetching updates for bare repo: {bare_git_dir}")
+    run(
+        [
+            "git",
+            f"--git-dir={str(bare_git_dir)}",
+            "fetch",
+            "origin",
+            GIT_ORIGIN_REFSPEC,
+            "--prune",
+            "--tags",
+        ]
+    )
+
+
+def worktree_exists(worktree_dir: Path) -> bool:
+    return worktree_dir.exists() and (worktree_dir / ".git").exists()
+
+
+def ensure_worktree(bare_git_dir: Path, branch: str, worktree_dir: Path) -> None:
+    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+    if worktree_exists(worktree_dir):
+        return
+    info(f"Creating worktree: {worktree_dir} (branch {branch})")
+    run(["git", f"--git-dir={str(bare_git_dir)}", "worktree", "add", str(worktree_dir), branch])
+
+
+def _remote_branch_ref(branch: str) -> str:
+    return f"refs/remotes/origin/{branch}"
+
+
+def _worktree_has_remote_branch(worktree_dir: Path, branch: str) -> bool:
+    try:
+        run(["git", "rev-parse", "--verify", "--quiet", _remote_branch_ref(branch)], cwd=worktree_dir, check=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def hard_reset_worktree_to_origin(worktree_dir: Path, branch: str) -> None:
+    run(["git", "fetch", "origin", GIT_ORIGIN_REFSPEC, "--prune", "--tags"], cwd=worktree_dir, check=True)
+
+    if not _worktree_has_remote_branch(worktree_dir, branch):
+        cp = run(["git", "branch", "-r"], cwd=worktree_dir, check=True, capture=True)
+        remote_branches = (cp.stdout or "").strip()
+        raise CfDevError(
+            f"Remote branch not found: origin/{branch}\n"
+            f"Worktree: {worktree_dir}\n"
+            f"Available remote branches:\n{remote_branches}"
+        )
+
+    remote_ref = _remote_branch_ref(branch)
+    run(["git", "checkout", "-B", branch, remote_ref], cwd=worktree_dir, check=True)
+    run(["git", "reset", "--hard", remote_ref], cwd=worktree_dir, check=True)
+    run(["git", "clean", "-fd"], cwd=worktree_dir, check=True)
+
+
+def ensure_odoo_sources(paths: Paths, versions: List[str], retries: int = 1) -> None:
+    require_cmd("git")
+
+    paths.odoo_comm_dir.mkdir(parents=True, exist_ok=True)
+    paths.odoo_ent_dir.mkdir(parents=True, exist_ok=True)
+
+    ensure_bare_clone(ODOO_COMM_GIT, paths.comm_bare_git, retries=retries)
+    ensure_bare_clone(ODOO_ENT_GIT, paths.ent_bare_git, retries=retries)
+
+    fetch_bare(paths.comm_bare_git)
+    fetch_bare(paths.ent_bare_git)
+
+    for v in versions:
+        comm_wt = paths.odoo_comm_dir / v
+        ent_wt = paths.odoo_ent_dir / v
+
+        if not worktree_exists(comm_wt):
+            ensure_worktree(paths.comm_bare_git, v, comm_wt)
+        else:
+            info(f"Resetting worktree to origin: {comm_wt} ({v})")
+            try:
+                hard_reset_worktree_to_origin(comm_wt, v)
+            except (subprocess.CalledProcessError, CfDevError) as e:
+                warn(f"Failed to reset {comm_wt}: {e}")
+
+        if not worktree_exists(ent_wt):
+            ensure_worktree(paths.ent_bare_git, v, ent_wt)
+        else:
+            info(f"Resetting worktree to origin: {ent_wt} ({v})")
+            try:
+                hard_reset_worktree_to_origin(ent_wt, v)
+            except (subprocess.CalledProcessError, CfDevError) as e:
+                warn(f"Failed to reset {ent_wt}: {e}")
+
+
+# ------------------------- customer repo setup -----------------------
+
+def clone_customer_repo(root: Path, url: str) -> Path:
+    require_cmd("git")
+    subpath = derive_repo_subpath_from_url(url)
+    target = root / subpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if target.exists():
+        return target
+
+    info(f"Cloning customer repo -> {target}")
+    run(["git", "clone", url, str(target)])
+    return target
+
+
+def init_submodules(repo_dir: Path) -> None:
+    require_cmd("git")
+    info("Initializing/updating submodules (recursive)...")
+    run(["git", "submodule", "update", "--init", "--recursive"], cwd=repo_dir, check=True)
+
+
+def ensure_uv() -> None:
+    require_cmd("uv")
+
+
+def uv_venv(repo_dir: Path, python_version: str) -> None:
+    ensure_uv()
+    info(f"Creating uv venv in {repo_dir / '.venv'} (Python {python_version})")
+    run(["uv", "venv", "--python", python_version], cwd=repo_dir)
+
+
+def uv_pip_install(repo_dir: Path, req_file: Path) -> None:
+    ensure_uv()
+    info(f"Installing requirements: {req_file}")
+    run(["uv", "pip", "install", "-r", str(req_file)], cwd=repo_dir)
+
+
+# ------------------ PyCharm run configurations (.run) -----------------
+
+INSTALL_RUN_TEMPLATE = """<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Install" type="Odoo" factoryName="Odoo">
+    <module name="{MODULE_NAME}" />
+    <option name="ENV_FILES" value="" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="" />
+    <option name="SDK_NAME" value="{SDK_NAME}" />
+    <option name="WORKING_DIRECTORY" value="" />
+    <option name="IS_MODULE_SDK" value="false" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+    <option name="RUN_TOOL" value="true" />
+    <option name="SCRIPT_NAME" value="{SCRIPT_NAME}" />
+    <option name="PARAMETERS" value="{PARAMETERS}" />
+    <option name="SHOW_COMMAND_LINE" value="false" />
+    <option name="EMULATE_TERMINAL" value="true" />
+    <method v="2" />
+  </configuration>
+</component>
+"""
+
+RUN_RUN_TEMPLATE = """<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Run" type="Odoo" factoryName="Odoo">
+    <module name="{MODULE_NAME}" />
+    <option name="ENV_FILES" value="" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="" />
+    <option name="SDK_NAME" value="{SDK_NAME}" />
+    <option name="WORKING_DIRECTORY" value="" />
+    <option name="IS_MODULE_SDK" value="false" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+    <option name="RUN_TOOL" value="true" />
+    <option name="SCRIPT_NAME" value="{SCRIPT_NAME}" />
+    <option name="PARAMETERS" value="{PARAMETERS}" />
+    <option name="SHOW_COMMAND_LINE" value="false" />
+    <option name="EMULATE_TERMINAL" value="true" />
+    <method v="2" />
+  </configuration>
+</component>
+"""
+
+UNITTEST_RUN_TEMPLATE = """<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Unittest" type="Odoo" factoryName="Odoo">
+    <module name="{MODULE_NAME}" />
+    <option name="ENV_FILES" value="" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="" />
+    <option name="SDK_NAME" value="{SDK_NAME}" />
+    <option name="WORKING_DIRECTORY" value="" />
+    <option name="IS_MODULE_SDK" value="false" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+    <option name="RUN_TOOL" value="true" />
+    <option name="SCRIPT_NAME" value="{SCRIPT_NAME}" />
+    <option name="PARAMETERS" value="{PARAMETERS}" />
+    <option name="SHOW_COMMAND_LINE" value="false" />
+    <option name="EMULATE_TERMINAL" value="true" />
+    <method v="2" />
+  </configuration>
+</component>
+"""
+
+
+def generate_pycharm_run_configurations(
+    *,
+    repo_dir: Path,
+    repo_name: str,
+    odoo_major: str,
+    module_to_install: str,
+) -> None:
+    run_dir = repo_dir / ".run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    sdk_name = f"uv ({repo_name})"
+    script_name = f"$PROJECT_DIR$/../../odoo/odoo/{odoo_major}/odoo-bin"
+    conf_arg = f"-c $PROJECT_DIR$/../{repo_name}.conf"
+
+    # Demo is controlled via config (without_demo), so we do NOT pass demo flags here.
+    install_params = f"{conf_arg} --no-http -i {module_to_install} --stop-after-init"
+    run_params = f"{conf_arg}"
+    unittest_params = (
+        f"{conf_arg} --test-enable -i {module_to_install} "
+        f"--test-tags /{module_to_install}:SomeTestClass.test01_some_unit_test"
+    )
+
+    def write(name: str, template: str, parameters: str) -> None:
+        content = template.format(
+            MODULE_NAME=repo_name,
+            SDK_NAME=sdk_name,
+            SCRIPT_NAME=script_name,
+            PARAMETERS=parameters,
+        )
+        (run_dir / name).write_text(content, encoding="utf-8")
+
+    write("Install.run.xml", INSTALL_RUN_TEMPLATE, install_params)
+    write("Run.run.xml", RUN_RUN_TEMPLATE, run_params)
+    write("Unittest.run.xml", UNITTEST_RUN_TEMPLATE, unittest_params)
+
+    info(f"Generated PyCharm run configurations in: {run_dir}")
+
+
+# -------------------- Odoo config template rendering -----------------
+
+def read_template(template_path: Path) -> str:
+    if not template_path.exists():
+        die(f"Template not found: {template_path}")
+    return template_path.read_text(encoding="utf-8")
+
+
+def render_template(template: str, variables: Dict[str, str]) -> str:
+    def repl(match: re.Match) -> str:
+        key = match.group(1)
+        return variables.get(key, match.group(0))
+
+    return re.sub(r"\{\{([A-Z0-9_]+)\}\}", repl, template)
+
+
+def compute_customer_addons_paths(repo_dir: Path) -> List[str]:
+    paths_list: List[str] = [str(repo_dir)]
+    for rel in CUSTOMER_ADDON_SUBFOLDERS:
+        p = repo_dir / rel
+        if p.exists() and p.is_dir():
+            paths_list.append(str(p))
+    return paths_list
+
+
+def upsert_conf_option(conf_text: str, key: str, value: str) -> str:
+    """
+    Ensure an [options] ini-style config contains `key = value`.
+    - If key exists (as `key = ...`), replace it.
+    - Else, insert it right after the [options] header if present.
+    - Else, append [options] section + key at the end.
+    """
+    pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*$")
+    if pattern.search(conf_text):
+        return pattern.sub(f"{key} = {value}", conf_text)
+
+    options_header = re.compile(r"(?m)^\s*\[options\]\s*$")
+    m = options_header.search(conf_text)
+    if m:
+        insert_pos = m.end()
+        return conf_text[:insert_pos] + f"\n{key} = {value}\n" + conf_text[insert_pos:]
+
+    return conf_text.rstrip() + f"\n\n[options]\n{key} = {value}\n"
+
+
+def create_odoo_conf(
+    *,
+    paths: Paths,
+    repo_dir: Path,
+    odoo_major: str,
+    db_name: str,
+    db_host: str,
+    db_port: str,
+    db_user: str,
+    db_password: str,
+    admin_passwd: str,
+    with_demo: bool,
+) -> Path:
+    tmpl = paths.config_dir / odoo_major / "odoo.conf.tmpl"
+    tmpl_text = read_template(tmpl)
+
+    customer_paths = compute_customer_addons_paths(repo_dir)
+
+    addons_path = ",".join(
+        [
+            str(paths.odoo_comm_dir / odoo_major / "addons"),
+            str(paths.odoo_ent_dir / odoo_major),
+            *customer_paths,
+        ]
+    )
+
+    conf_out = repo_dir.with_suffix(".conf")
+
+    variables = {
+        "ODOO_ADDONS_PATH": addons_path,
+        "DB_HOST": db_host,
+        "DB_PORT": db_port,
+        "DB_USER": db_user,
+        "DB_PASSWORD": db_password,
+        "DB_NAME": db_name,
+        "ADMIN_PASSWD": admin_passwd,
+    }
+
+    rendered = render_template(tmpl_text, variables)
+
+    # Demo behavior is controlled via config:
+    # - install demo data => without_demo = False
+    # - no demo data      => without_demo = all
+    rendered = upsert_conf_option(rendered, "without_demo", "False" if with_demo else "all")
+
+    conf_out.write_text(rendered, encoding="utf-8")
+    info(f"Created config: {conf_out}")
+    return conf_out
+
+
+# ----------------------------- postgres ------------------------------
+
+def _psql_env(password: str) -> Dict[str, str]:
+    env = os.environ.copy()
+    if password:
+        env["PGPASSWORD"] = password
+    return env
+
+
+def psql_can_connect(user: str, host: str, port: str, db: str, password: str) -> bool:
+    try:
+        run(
+            ["psql", "-h", host, "-p", port, "-U", user, "-d", db, "-c", "select 1;"],
+            env=_psql_env(password),
+            check=True,
+            capture=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def ensure_pg_role(db_user: str, db_password: str, host: str, port: str) -> None:
+    require_cmd("psql")
+
+    if psql_can_connect(db_user, host, port, "postgres", db_password):
+        info(f"Postgres role works: {db_user}")
+        return
+
+    info(
+        "Cannot connect using configured DB_USER/DB_PASSWORD. "
+        "Attempting to create/alter role via local OS user (psql -d postgres)."
+    )
+
+    sql = textwrap.dedent(
+        f"""
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{db_user}') THEN
+            CREATE ROLE {db_user} WITH LOGIN SUPERUSER PASSWORD '{db_password}';
+          ELSE
+            ALTER ROLE {db_user} WITH LOGIN SUPERUSER PASSWORD '{db_password}';
+          END IF;
+        END
+        $$;
+        """
+    ).strip()
+
+    try:
+        run(["psql", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", sql], check=True)
+        info(f"Role ensured: {db_user}")
+    except subprocess.CalledProcessError:
+        die(
+            "Unable to connect to local Postgres as OS user to create role. "
+            "Create the role manually or adjust DB settings."
+        )
+
+
+def db_exists(db_name: str, host: str, port: str, user: str, password: str) -> bool:
+    cp = run(
+        [
+            "psql",
+            "-h",
+            host,
+            "-p",
+            port,
+            "-U",
+            user,
+            "-d",
+            "postgres",
+            "-tAc",
+            f"SELECT 1 FROM pg_database WHERE datname = '{db_name}';",
+        ],
+        env=_psql_env(password),
+        check=True,
+        capture=True,
+    )
+    return (cp.stdout or "").strip() == "1"
+
+
+def drop_and_create_db(db_name: str, host: str, port: str, user: str, password: str) -> None:
+    info(f"Recreating database: {db_name}")
+
+    terminate_sql = (
+        "SELECT pg_terminate_backend(pid) "
+        "FROM pg_stat_activity "
+        f"WHERE datname = '{db_name}' AND pid <> pg_backend_pid();"
+    )
+    drop_sql = f'DROP DATABASE IF EXISTS "{db_name}";'
+    create_sql = f'CREATE DATABASE "{db_name}";'
+
+    for sql in (terminate_sql, drop_sql, create_sql):
+        run(
+            ["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", sql],
+            env=_psql_env(password),
+            check=True,
+        )
+
+
+# ------------------------------ odoo db ------------------------------
+
+def find_odoo_bin(paths: Paths, odoo_major: str) -> Path:
+    odoo_bin = paths.odoo_comm_dir / odoo_major / "odoo-bin"
+    if not odoo_bin.exists():
+        die(f"odoo-bin not found: {odoo_bin}")
+    return odoo_bin
+
+
+def install_database(
+    *,
+    paths: Paths,
+    repo_dir: Path,
+    conf_path: Path,
+    odoo_major: str,
+    db_name: str,
+    module: str,
+) -> None:
+    odoo_bin = find_odoo_bin(paths, odoo_major)
+
+    venv_py = repo_dir / ".venv" / "bin" / "python"
+    if not venv_py.exists():
+        die(f"Venv python not found: {venv_py}. Did venv creation succeed?")
+
+    cmd = [
+        str(venv_py),
+        str(odoo_bin),
+        "-c",
+        str(conf_path),
+        "--no-http",
+        "-d",
+        db_name,
+        "--stop-after-init",
+        "-i",
+        module,
+    ]
+
+    info(f"Installing database '{db_name}' (module: {module})")
+    info(f"Running: {pretty_cmd(cmd)}")
+    run(cmd, cwd=paths.odoo_comm_dir / odoo_major, check=True)
+    info("Database installation completed.")
+
+
+# ------------------------------ planning ------------------------------
+
+def collect_setup_plan(
+    *,
+    repo_url: Optional[str],
+    versions: List[str],
+    db: bool,
+    demo: Optional[bool],
+    module: Optional[str],
+    non_interactive: bool,
+) -> SetupPlan:
+    """
+    Minimize prompts:
+    1) Ask repo URL
+    2) Ask: use default configuration?
+       - if yes: use defaults for db_host/port/user/pass/admin_passwd
+       - if no: ask all db/admin params
+    Then DB install + demo + module (defaults to xx_all)
+
+    Also: derive db_name from repo url early, so we can check DB existence before heavy work.
+    """
+    ensure_uv()
+
+    if not repo_url:
+        if non_interactive:
+            die("Missing --repo in non-interactive mode.")
+        repo_url = prompt_str("Enter customer repo clone URL (SSH/HTTPS)")
+        if not repo_url:
+            die("Repo URL is required.")
+
+    derived_db_name = derive_db_name_from_repo_url(repo_url)
+
+    if non_interactive:
+        use_default_cfg = True
+    else:
+        use_default_cfg = prompt_yes_no(
+            f"Use default configuration? ({DEFAULT_DB_HOST}:{DEFAULT_DB_PORT}, user={DEFAULT_DB_USER})",
+            default_no=False,
+        )
+
+    if use_default_cfg:
+        db_host = DEFAULT_DB_HOST
+        db_port = DEFAULT_DB_PORT
+        db_user = DEFAULT_DB_USER
+        db_password = DEFAULT_DB_PASSWORD
+        admin_passwd = DEFAULT_ADMIN_PASSWD
+    else:
+        db_host = prompt_str("DB host", DEFAULT_DB_HOST)
+        db_port = prompt_str("DB port", DEFAULT_DB_PORT)
+        db_user = prompt_str("DB user", DEFAULT_DB_USER)
+        db_password = prompt_str("DB password", DEFAULT_DB_PASSWORD)
+        admin_passwd = prompt_str("Odoo admin_passwd", DEFAULT_ADMIN_PASSWD)
+
+    do_db = db
+    if not non_interactive and not db:
+        do_db = prompt_yes_no("Create/install local database now?", default_no=True)
+
+    if do_db:
+        if demo is None and not non_interactive:
+            with_demo = prompt_yes_no("Install demo data?", default_no=True)
+        elif demo is not None:
+            with_demo = demo
+        else:
+            with_demo = False
+
+        if module is None:
+            module_to_install = DEFAULT_INSTALL_MODULE if non_interactive else prompt_str(
+                "Module to install", DEFAULT_INSTALL_MODULE
+            )
+        else:
+            module_to_install = module
+    else:
+        with_demo = False
+        module_to_install = ""
+
+    # Decide recreate_db now (check DB existence), but do not drop yet in collection.
+    recreate_db = False
+    if do_db:
+        require_cmd("psql")
+        ensure_pg_role(db_user, db_password, db_host, db_port)
+
+        exists = db_exists(derived_db_name, db_host, db_port, db_user, db_password)
+        if exists and not non_interactive:
+            recreate_db = prompt_yes_no(
+                f"Database '{derived_db_name}' already exists. Recreate it (drop & create) before setup?",
+                default_no=True,
+            )
+        elif exists and non_interactive:
+            warn(f"Database '{derived_db_name}' already exists. Non-interactive mode: leaving it as-is.")
+
+    return SetupPlan(
+        repo_url=repo_url,
+        repo_dir=None,
+        odoo_major=None,
+        python_version=None,
+        odoo_versions_to_ensure=list(versions),
+        db_name=derived_db_name,
+        use_default_config=use_default_cfg,
+        db_host=db_host,
+        db_port=db_port,
+        db_user=db_user,
+        db_password=db_password,
+        admin_passwd=admin_passwd,
+        do_db=do_db,
+        with_demo=with_demo,
+        module_to_install=module_to_install,
+        recreate_db=recreate_db,
+    )
+
+
+# ------------------------------ execution ------------------------------
+
+def execute_setup_plan(paths: Paths, plan: SetupPlan) -> None:
+    require_cmd("git")
+    require_cmd("python3")
+    ensure_uv()
+
+    # 0) If requested, recreate DB BEFORE heavy work
+    if plan.do_db and plan.recreate_db:
+        drop_and_create_db(plan.db_name, plan.db_host, plan.db_port, plan.db_user, plan.db_password)
+
+    # 1) Clone customer repo
+    repo_dir = clone_customer_repo(paths.root, plan.repo_url)
+    plan.repo_dir = repo_dir
+
+    if repo_dir.name != plan.db_name:
+        warn(
+            f"Derived db_name '{plan.db_name}' differs from repo folder name '{repo_dir.name}'. "
+            f"Continuing with db_name='{plan.db_name}'."
+        )
+
+    # 2) Init submodules
+    init_submodules(repo_dir)
+
+    # 3) Detect Odoo version
+    odoo_major = detect_odoo_version(repo_dir)
+    plan.odoo_major = odoo_major
+    info(f"Detected Odoo version: {odoo_major}")
+
+    # 4) Determine Python version
+    ensure_assets(paths, [odoo_major])
+    mapping = load_python_mapping(paths.mapping_file)
+    python_version = map_python_version(odoo_major, mapping)
+    plan.python_version = python_version
+    info(f"Mapped Python version: {python_version}")
+
+    # 5) Ensure Odoo sources (defaults + detected)
+    versions_to_ensure: List[str] = []
+    for v in (plan.odoo_versions_to_ensure + [odoo_major]):
+        if v not in versions_to_ensure:
+            versions_to_ensure.append(v)
+    ensure_odoo_sources(paths, versions_to_ensure, retries=1)
+
+    # 6) Create venv
+    uv_venv(repo_dir, python_version)
+
+    # 7) Generate PyCharm run configurations right after venv creation
+    generate_pycharm_run_configurations(
+        repo_dir=repo_dir,
+        repo_name=repo_dir.name,
+        odoo_major=odoo_major,
+        module_to_install=plan.module_to_install or DEFAULT_INSTALL_MODULE,
+    )
+
+    # 8) Upgrade pip and setuptools
+    run(["uv", "pip", "install", "--upgrade", "pip", "setuptools"], cwd=repo_dir)
+
+    # 9) Install dependencies
+    odoo_req = paths.odoo_comm_dir / odoo_major / "requirements.txt"
+    if not odoo_req.exists():
+        die(f"Odoo requirements not found: {odoo_req}")
+    uv_pip_install(repo_dir, odoo_req)
+
+    repo_req = repo_dir / "requirements.txt"
+    if repo_req.exists():
+        uv_pip_install(repo_dir, repo_req)
+    else:
+        info("No repo requirements.txt found; skipping.")
+
+    # 10) Create config (includes without_demo based on prompt)
+    conf_path = create_odoo_conf(
+        paths=paths,
+        repo_dir=repo_dir,
+        odoo_major=odoo_major,
+        db_name=plan.db_name,
+        db_host=plan.db_host,
+        db_port=plan.db_port,
+        db_user=plan.db_user,
+        db_password=plan.db_password,
+        admin_passwd=plan.admin_passwd,
+        with_demo=plan.with_demo,
+    )
+
+    # 11) Optional DB install (no demo flags; config controls demo)
+    if plan.do_db:
+        ensure_pg_role(plan.db_user, plan.db_password, plan.db_host, plan.db_port)
+
+        install_database(
+            paths=paths,
+            repo_dir=repo_dir,
+            conf_path=conf_path,
+            odoo_major=odoo_major,
+            db_name=plan.db_name,
+            module=plan.module_to_install or DEFAULT_INSTALL_MODULE,
+        )
+    else:
+        info("Skipping database installation.")
+
+    info(f"Done. Repo: {repo_dir} | Config: {conf_path}")
+
+
+# ------------------------------ actions ------------------------------
+
+def action_setup(
+    *,
+    paths: Paths,
+    repo_url: Optional[str],
+    versions: List[str],
+    db: bool,
+    demo: Optional[bool],
+    module: Optional[str],
+    non_interactive: bool,
+) -> None:
+    plan = collect_setup_plan(
+        repo_url=repo_url,
+        versions=versions,
+        db=db,
+        demo=demo,
+        module=module,
+        non_interactive=non_interactive,
+    )
+    execute_setup_plan(paths, plan)
+
+
+def action_update(paths: Paths) -> None:
+    require_cmd("git")
+    ensure_odoo_sources(paths, DEFAULT_ODOO_VERSIONS, retries=1)
+    info("Odoo worktrees ensured/updated (default versions).")
+
+
+def action_menu(paths: Paths) -> None:
+    while True:
+        click.echo("")
+        click.echo("Codeforward Dev Environment Manager (cf-dev-bootstrap)")
+        click.echo(f"Workspace root: {paths.root}")
+        click.echo("")
+        click.echo("Choose an action:")
+        click.echo("  1) Setup customer dev environment")
+        click.echo("  2) Update Odoo worktrees")
+        click.echo("  3) Exit")
+        click.echo("")
+
+        choice = prompt_str("Enter choice (1-3)")
+        if choice == "1":
+            action_setup(
+                paths=paths,
+                repo_url=None,
+                versions=DEFAULT_ODOO_VERSIONS,
+                db=False,
+                demo=None,
+                module=None,
+                non_interactive=False,
+            )
+        elif choice == "2":
+            action_update(paths)
+        elif choice == "3":
+            return
+        else:
+            warn(f"Invalid choice: {choice}")
+
+
+# ------------------------------ click CLI ------------------------------
+
+def _validate_demo_flags(demo: bool, no_demo: bool) -> None:
+    if demo and no_demo:
+        raise CfDevError("Use only one of --demo or --no-demo.")
+
+
+@click.group(
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+@click.pass_context
+def cli(ctx: click.Context) -> None:
+    """Run without subcommands to open the interactive menu."""
+    if ctx.invoked_subcommand is None:
+        paths = ensure_paths()
+        action_menu(paths)
+
+
+@cli.command("setup")
+@click.option("--repo", "repo_url", type=str, required=False)
+@click.option("--versions", multiple=True, default=DEFAULT_ODOO_VERSIONS, show_default=True)
+@click.option("--db", is_flag=True)
+@click.option("--demo", is_flag=True)
+@click.option("--no-demo", is_flag=True)
+@click.option("--module", type=str, required=False)
+@click.option("--non-interactive", is_flag=True)
+def setup_cmd(
+    repo_url: Optional[str],
+    versions: Tuple[str, ...],
+    db: bool,
+    demo: bool,
+    no_demo: bool,
+    module: Optional[str],
+    non_interactive: bool,
+) -> None:
+    paths = ensure_paths()
+    _validate_demo_flags(demo, no_demo)
+
+    demo_value: Optional[bool] = None
+    if demo:
+        demo_value = True
+    elif no_demo:
+        demo_value = False
+
+    action_setup(
+        paths=paths,
+        repo_url=repo_url,
+        versions=list(versions),
+        db=db,
+        demo=demo_value,
+        module=module,
+        non_interactive=non_interactive,
+    )
+
+
+@cli.command("update-odoo")
+def update_odoo_cmd() -> None:
+    paths = ensure_paths()
+    action_update(paths)
+
+
+def main() -> int:
+    try:
+        cli(standalone_mode=False)
+        return 0
+    except CfDevError as e:
+        click.echo(f"ERROR: {e}", err=True)
+        return 1
+    except click.ClickException as e:
+        e.show()
+        return e.exit_code
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.", err=True)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
