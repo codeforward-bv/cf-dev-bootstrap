@@ -6,9 +6,11 @@ set -euo pipefail
 #
 # - Installs Homebrew if missing (macOS only)
 # - Runs `brew update`
-# - Installs deps via Brewfile: `brew bundle --file=...`
-# - Installs cf-dev-bootstrap into ~/.local/bin
-# - Ensures python package 'click' exists for python3
+# - Installs deps via Brewfile: `brew bundle --file=...` (includes python)
+# - Installs cf-dev-bootstrap into ~/.local/bin as a wrapper
+# - Downloads the real cf-dev-bootstrap script into ~/.local/share/cf-dev-bootstrap/
+# - Creates a dedicated venv for cf-dev-bootstrap (avoids PEP 668)
+# - Ensures python package 'click' exists in that venv
 #
 # Safe to re-run.
 # ------------------------------------------------------------------
@@ -17,6 +19,11 @@ REPO_RAW_BASE="https://raw.githubusercontent.com/codeforward-bv/cf-dev-bootstrap
 
 CF_DEV_BIN_DIR="${HOME}/.local/bin"
 CF_DEV_BIN="${CF_DEV_BIN_DIR}/cf-dev-bootstrap"
+
+CF_DEV_STATE_DIR="${HOME}/.local/share/cf-dev-bootstrap"
+CF_DEV_SCRIPT="${CF_DEV_STATE_DIR}/cf-dev-bootstrap"
+CF_DEV_VENV_DIR="${CF_DEV_STATE_DIR}/venv"
+CF_DEV_PY="${CF_DEV_VENV_DIR}/bin/python"
 
 TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "${TMP_DIR}"; }
@@ -35,7 +42,7 @@ if [[ "$(uname)" == "Darwin" ]]; then
     echo "Homebrew not found. Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-    # Try to make brew available in this shell (Apple Silicon default path)
+    # Try to make brew available in this shell
     if [[ -x /opt/homebrew/bin/brew ]]; then
       eval "$(/opt/homebrew/bin/brew shellenv)"
     elif [[ -x /usr/local/bin/brew ]]; then
@@ -58,29 +65,113 @@ if [[ "$(uname)" == "Darwin" ]]; then
   BREWFILE_PATH="${TMP_DIR}/Brewfile"
   curl -fsSL "${REPO_RAW_BASE}/Brewfile" -o "${BREWFILE_PATH}"
 
-  # Install as defined in Brewfile (including restart_service: :changed)
+  # Install as defined in Brewfile (including python)
   brew bundle --file="${BREWFILE_PATH}"
 
   echo
 else
   echo "Non-macOS system detected. Skipping Homebrew/Brewfile dependency install."
-  echo "You must install dependencies manually: uv, and optionally postgresql/psql."
+  echo "You must install dependencies manually: python3 (with venv), and optionally postgresql/psql."
   echo
 fi
 
 # ------------------------------------------------------------------
-# 2) Install cf-dev-bootstrap
+# 2) Ensure brew paths are preferred (macOS) so python3 is Homebrew Python
+# ------------------------------------------------------------------
+if [[ "$(uname)" == "Darwin" ]]; then
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    export PATH="/opt/homebrew/bin:${PATH}"
+  elif [[ -x /usr/local/bin/brew ]]; then
+    export PATH="/usr/local/bin:${PATH}"
+  fi
+fi
+
+# ------------------------------------------------------------------
+# 3) Ensure python3 exists
+# ------------------------------------------------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 not found on PATH."
+  if [[ "$(uname)" == "Darwin" ]]; then
+    echo "Ensure 'python' is included in your Brewfile (brew bundle)."
+  fi
+  exit 1
+fi
+
+# ------------------------------------------------------------------
+# 4) Download cf-dev-bootstrap script (stored outside PATH)
+# ------------------------------------------------------------------
+mkdir -p "${CF_DEV_STATE_DIR}"
+
+echo "Downloading cf-dev-bootstrap script to ${CF_DEV_SCRIPT} ..."
+curl -fsSL "${REPO_RAW_BASE}/cf-dev-bootstrap" -o "${CF_DEV_SCRIPT}"
+chmod +x "${CF_DEV_SCRIPT}"
+echo "  ✔ cf-dev-bootstrap script installed"
+
+echo
+
+# ------------------------------------------------------------------
+# 5) Create/ensure dedicated venv for cf-dev-bootstrap + install click
+# ------------------------------------------------------------------
+if [[ ! -x "${CF_DEV_PY}" ]]; then
+  echo "Creating virtual environment for cf-dev-bootstrap at ${CF_DEV_VENV_DIR} ..."
+  python3 -m venv "${CF_DEV_VENV_DIR}"
+  echo "  ✔ venv created"
+else
+  echo "Virtual environment already exists at ${CF_DEV_VENV_DIR}"
+fi
+
+echo "Ensuring Python dependency 'click' is installed in cf-dev-bootstrap venv..."
+"${CF_DEV_PY}" - <<'PY'
+import importlib.util
+import subprocess
+import sys
+
+if importlib.util.find_spec("click") is None:
+    print("  → Installing click")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "click"])
+else:
+    print("  ✔ click already installed")
+PY
+
+echo
+
+# ------------------------------------------------------------------
+# 6) Install wrapper into ~/.local/bin
 # ------------------------------------------------------------------
 mkdir -p "${CF_DEV_BIN_DIR}"
 
-echo "Installing cf-dev-bootstrap to ${CF_DEV_BIN} ..."
-curl -fsSL "${REPO_RAW_BASE}/cf-dev-bootstrap" -o "${CF_DEV_BIN}"
+echo "Installing cf-dev-bootstrap wrapper to ${CF_DEV_BIN} ..."
+cat > "${CF_DEV_BIN}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CF_DEV_PY="${HOME}/.local/share/cf-dev-bootstrap/venv/bin/python"
+CF_DEV_SCRIPT="${HOME}/.local/share/cf-dev-bootstrap/cf-dev-bootstrap"
+
+if [[ ! -x "${CF_DEV_PY}" ]]; then
+  echo "ERROR: cf-dev-bootstrap virtualenv not found at:"
+  echo "  ${CF_DEV_PY}"
+  echo "Re-run the installer."
+  exit 1
+fi
+
+if [[ ! -f "${CF_DEV_SCRIPT}" ]]; then
+  echo "ERROR: cf-dev-bootstrap script not found at:"
+  echo "  ${CF_DEV_SCRIPT}"
+  echo "Re-run the installer."
+  exit 1
+fi
+
+exec "${CF_DEV_PY}" "${CF_DEV_SCRIPT}" "$@"
+EOF
+
 chmod +x "${CF_DEV_BIN}"
-echo "  ✔ cf-dev-bootstrap installed"
+echo "  ✔ wrapper installed"
 
 echo
+
 # ------------------------------------------------------------------
-# 3) Ensure ~/.local/bin is on PATH
+# 7) Ensure ~/.local/bin is on PATH
 # ------------------------------------------------------------------
 ZSHRC="${HOME}/.zshrc"
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
@@ -88,10 +179,8 @@ PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${CF_DEV_BIN_DIR}"; then
   echo "Adding ~/.local/bin to PATH in ${ZSHRC}..."
 
-  # Ensure file exists
   touch "${ZSHRC}"
 
-  # Only add if not already present
   if ! grep -Fq "${PATH_LINE}" "${ZSHRC}"; then
     {
       echo
@@ -107,25 +196,4 @@ if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${CF_DEV_BIN_DIR}"; then
   echo
 fi
 
-# ------------------------------------------------------------------
-# 4) Ensure click is installed for python3
-# ------------------------------------------------------------------
-if command -v python3 >/dev/null 2>&1; then
-  echo "Ensuring Python dependency 'click' is installed for python3..."
-  python3 - <<'PY'
-import importlib.util
-import subprocess
-import sys
-
-if importlib.util.find_spec("click") is None:
-    print("  → Installing click (user site)")
-    subprocess.check_call([sys.executable, "-m", "pip3", "install", "--user", "click"])
-else:
-    print("  ✔ click already installed")
-PY
-else
-  echo "WARNING: python3 not found on PATH. Install Python 3 and ensure 'click' is installed."
-fi
-
-echo
 echo "== Installation complete =="
