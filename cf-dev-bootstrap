@@ -465,6 +465,41 @@ def ensure_odoo_sources(paths: Paths, versions: List[str], retries: int = 1) -> 
                 warn(f"Failed to reset {ent_wt}: {e}")
 
 
+def add_odoo_worktree(paths: Paths, version: str, retries: int = 1) -> None:
+    """
+    Ensure worktrees for a single Odoo version exist (community + enterprise).
+    Does NOT touch other versions.
+    """
+    require_cmd("git")
+
+    # Ensure bare clones exist
+    paths.odoo_comm_dir.mkdir(parents=True, exist_ok=True)
+    paths.odoo_ent_dir.mkdir(parents=True, exist_ok=True)
+
+    ensure_bare_clone(ODOO_COMM_GIT, paths.comm_bare_git, retries=retries)
+    ensure_bare_clone(ODOO_ENT_GIT, paths.ent_bare_git, retries=retries)
+
+    # Fetch refs so branch exists locally
+    fetch_bare(paths.comm_bare_git)
+    fetch_bare(paths.ent_bare_git)
+
+    # Ensure worktrees
+    comm_wt = paths.odoo_comm_dir / version
+    ent_wt = paths.odoo_ent_dir / version
+
+    if not worktree_exists(comm_wt):
+        info(f"Creating community worktree for {version}: {comm_wt}")
+        ensure_worktree(paths.comm_bare_git, version, comm_wt)
+    else:
+        info(f"Community worktree already exists: {comm_wt}")
+
+    if not worktree_exists(ent_wt):
+        info(f"Creating enterprise worktree for {version}: {ent_wt}")
+        ensure_worktree(paths.ent_bare_git, version, ent_wt)
+    else:
+        info(f"Enterprise worktree already exists: {ent_wt}")
+
+
 # ------------------------- customer repo setup -----------------------
 
 def clone_customer_repo(root: Path, url: str) -> Path:
@@ -524,6 +559,35 @@ def install_external_requirements(repo_dir: Path) -> None:
     for req in req_files:
         info(f"  - {req.relative_to(repo_dir)}")
         uv_pip_install(repo_dir, req)
+
+
+def discover_worktree_versions_from_git(bare_git_dir: Path) -> List[str]:
+    """
+    Discover worktree versions by asking git (porcelain output).
+    Returns versions like ["15.0", "17.0"] sorted numerically.
+    """
+    require_cmd("git")
+
+    if not bare_git_dir.exists():
+        return []
+
+    cp = run(
+        ["git", f"--git-dir={str(bare_git_dir)}", "worktree", "list", "--porcelain"],
+        capture=True,
+        check=True,
+    )
+
+    versions: set[str] = set()
+    for line in (cp.stdout or "").splitlines():
+        # branch refs/heads/19.0
+        if line.startswith("branch "):
+            ref = line.split(" ", 1)[1].strip()
+            if ref.startswith("refs/heads/"):
+                branch = ref.replace("refs/heads/", "", 1)
+                if re.match(r"^[0-9]{2}\.0$", branch):
+                    versions.add(branch)
+
+    return sorted(versions, key=lambda v: int(v.split(".")[0]))
 
 
 # ------------------ PyCharm run configurations (.run) -----------------
@@ -879,7 +943,7 @@ def collect_setup_plan(
     versions: List[str],
     db: bool,
     demo: Optional[bool],
-    module: Optional[bool],
+    module: Optional[str],
     non_interactive: bool,
 ) -> SetupPlan:
     """
@@ -1113,8 +1177,32 @@ def action_setup(
 
 def action_update(paths: Paths) -> None:
     require_cmd("git")
-    ensure_odoo_sources(paths, DEFAULT_ODOO_VERSIONS, retries=1)
-    info("Odoo worktrees ensured/updated (default versions).")
+
+    # If bare clones don’t exist yet, just ensure defaults (this will create them)
+    if not paths.comm_bare_git.exists() or not paths.ent_bare_git.exists():
+        info("Odoo bare clones not found yet; creating default worktrees first...")
+        ensure_odoo_sources(paths, DEFAULT_ODOO_VERSIONS, retries=1)
+        info("Odoo worktrees ensured/updated (default versions).")
+        return
+
+    comm_versions = discover_worktree_versions_from_git(paths.comm_bare_git)
+    ent_versions = discover_worktree_versions_from_git(paths.ent_bare_git)
+
+    # Union of versions currently present as worktrees
+    discovered: List[str] = []
+    for v in (comm_versions + ent_versions):
+        if v not in discovered:
+            discovered.append(v)
+
+    # Always include defaults too (so they get created/updated as well)
+    versions_to_update: List[str] = []
+    for v in (DEFAULT_ODOO_VERSIONS + discovered):
+        if v not in versions_to_update:
+            versions_to_update.append(v)
+
+    info(f"Updating Odoo worktrees: {', '.join(versions_to_update)}")
+    ensure_odoo_sources(paths, versions_to_update, retries=1)
+    info("Odoo worktrees ensured/updated.")
 
 
 def action_menu(paths: Paths) -> None:
@@ -1126,10 +1214,11 @@ def action_menu(paths: Paths) -> None:
         click.echo("Choose an action:")
         click.echo("  1) Setup customer dev environment")
         click.echo("  2) Update Odoo worktrees")
-        click.echo("  3) Exit")
+        click.echo("  3) Add Odoo worktree for specific version")
+        click.echo("  4) Exit")
         click.echo("")
 
-        choice = prompt_str("Enter choice (1-3)")
+        choice = prompt_str("Enter choice (1-4)")
         if choice == "1":
             action_setup(
                 paths=paths,
@@ -1143,9 +1232,17 @@ def action_menu(paths: Paths) -> None:
         elif choice == "2":
             action_update(paths)
         elif choice == "3":
+            version = prompt_str("Enter Odoo version to add worktree for (e.g. 15.0)")
+            if not re.match(r"^[0-9]{2}\.0$", version):
+                warn("Invalid version. Expected format like '15.0', '17.0', '19.0'.")
+                continue
+            add_odoo_worktree(paths, version, retries=1)
+            info(f"Done. Worktrees ensured for version {version}.")
+        elif choice == "4":
             return
         else:
             warn(f"Invalid choice: {choice}")
+
 
     # ------------------------------ click CLI ------------------------------
 
@@ -1208,6 +1305,21 @@ def setup_cmd(
 def update_odoo_cmd() -> None:
     paths = ensure_paths()
     action_update(paths)
+
+
+@cli.command("add-worktree")
+@click.argument("version", type=str)
+def add_worktree_cmd(version: str) -> None:
+    """
+    Add (ensure) Odoo worktrees for a specific version, e.g. 15.0.
+    """
+    # Basic validation to avoid typos like "15"
+    if not re.match(r"^[0-9]{2}\.0$", version):
+        raise CfDevError("Version must look like '15.0', '17.0', '19.0'.")
+
+    paths = ensure_paths()
+    add_odoo_worktree(paths, version, retries=1)
+    info(f"Done. Worktrees ensured for version {version}.")
 
 
 def main() -> int:
