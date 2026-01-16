@@ -6,7 +6,8 @@ set -euo pipefail
 #
 # - Installs Homebrew if missing (macOS only)
 # - Runs `brew update`
-# - Installs deps via Brewfile: `brew bundle --file=...` (includes python)
+# - Installs deps via Brewfile: `brew bundle --file=...` (includes python + uv)
+# - Globally installs pre-commit via uv tool (with pre-commit-uv)
 # - Installs cf-dev-bootstrap into ~/.local/bin as a wrapper
 # - Downloads the real cf-dev-bootstrap script into ~/.local/share/cf-dev-bootstrap/
 # - Creates a dedicated venv for cf-dev-bootstrap (avoids PEP 668)
@@ -65,13 +66,13 @@ if [[ "$(uname)" == "Darwin" ]]; then
   BREWFILE_PATH="${TMP_DIR}/Brewfile"
   curl -fsSL "${REPO_RAW_BASE}/Brewfile" -o "${BREWFILE_PATH}"
 
-  # Install as defined in Brewfile (including python)
+  # Install as defined in Brewfile (including python + uv)
   brew bundle --file="${BREWFILE_PATH}"
 
   echo
 else
   echo "Non-macOS system detected. Skipping Homebrew/Brewfile dependency install."
-  echo "You must install dependencies manually: python3 (with venv), and optionally postgresql/psql."
+  echo "You must install dependencies manually: python3 (with venv), uv, and optionally postgresql/psql."
   echo
 fi
 
@@ -98,7 +99,22 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------
-# 4) Download cf-dev-bootstrap script (stored outside PATH)
+# 4) Ensure uv exists, then install pre-commit globally using uv tool
+# ------------------------------------------------------------------
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: uv not found on PATH."
+  echo "Ensure 'uv' is included in your Brewfile and re-run this installer."
+  exit 1
+fi
+
+echo "Installing pre-commit globally via uv tool..."
+# Idempotent: uv tool install will no-op if already installed (or upgrade as needed)
+uv tool install pre-commit --with pre-commit-uv
+echo "  ✔ pre-commit installed (uv tool)"
+echo
+
+# ------------------------------------------------------------------
+# 5) Download cf-dev-bootstrap script (stored outside PATH)
 # ------------------------------------------------------------------
 mkdir -p "${CF_DEV_STATE_DIR}"
 
@@ -106,11 +122,10 @@ echo "Downloading cf-dev-bootstrap script to ${CF_DEV_SCRIPT} ..."
 curl -fsSL "${REPO_RAW_BASE}/cf-dev-bootstrap" -o "${CF_DEV_SCRIPT}"
 chmod +x "${CF_DEV_SCRIPT}"
 echo "  ✔ cf-dev-bootstrap script installed"
-
 echo
 
 # ------------------------------------------------------------------
-# 5) Create/ensure dedicated venv for cf-dev-bootstrap + install click
+# 6) Create/ensure dedicated venv for cf-dev-bootstrap + install click
 # ------------------------------------------------------------------
 if [[ ! -x "${CF_DEV_PY}" ]]; then
   echo "Creating virtual environment for cf-dev-bootstrap at ${CF_DEV_VENV_DIR} ..."
@@ -136,7 +151,7 @@ PY
 echo
 
 # ------------------------------------------------------------------
-# 6) Install wrapper into ~/.local/bin
+# 7) Install wrapper into ~/.local/bin
 # ------------------------------------------------------------------
 mkdir -p "${CF_DEV_BIN_DIR}"
 
@@ -167,11 +182,10 @@ EOF
 
 chmod +x "${CF_DEV_BIN}"
 echo "  ✔ wrapper installed"
-
 echo
 
 # ------------------------------------------------------------------
-# 7) Ensure ~/.local/bin is on PATH
+# 8) Ensure ~/.local/bin is on PATH
 # ------------------------------------------------------------------
 ZSHRC="${HOME}/.zshrc"
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'

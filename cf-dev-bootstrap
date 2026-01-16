@@ -7,15 +7,13 @@ Key features:
 - Customer repo clone + submodules init (--init --recursive)
 - uv venv + deps
 - Odoo conf generation with additional optional addon paths
-- Demo data is controlled via odoo.conf:
-    without_demo = False   (install demo data)
-    without_demo = all     (no demo data)
-  No --with-demo/--without-demo flags are passed to odoo-bin.
+- Demo data controlled via odoo.conf (without_demo = False/all)
 - PyCharm .run configurations generated after venv creation
 - Optional DB install with:
   - DB existence check + prompt to drop & recreate BEFORE heavy work (clone/install)
 - Reduced prompts: "Use default configuration?" first, otherwise ask all db/admin params
 - Uses '--no-http' when installing using odoo-bin
+- Installs requirements.txt under external/** recursively
 """
 
 from __future__ import annotations
@@ -225,6 +223,26 @@ def ensure_paths() -> Paths:
         mapping_file=mapping_file,
         config_dir=config_dir,
     )
+
+
+def ensure_precommit_hooks(repo_dir: Path) -> None:
+    """
+    Install git hooks if the repo uses pre-commit.
+    - Only runs when .pre-commit-config.yaml exists.
+    - Assumes 'pre-commit' is available on PATH (installed via uv tool in install.sh).
+    """
+    cfg = repo_dir / ".pre-commit-config.yaml"
+    if not cfg.exists():
+        info("No .pre-commit-config.yaml found; skipping pre-commit hooks install.")
+        return
+
+    if which("pre-commit") is None:
+        warn("pre-commit not found on PATH; skipping hook install. Re-run install.sh.")
+        return
+
+    info("Installing pre-commit hooks in customer repo...")
+    run(["pre-commit", "install"], cwd=repo_dir, check=True)
+    info("  ✔ pre-commit hooks installed")
 
 
 # ------------------------- repo name derivation -----------------------
@@ -485,6 +503,29 @@ def uv_pip_install(repo_dir: Path, req_file: Path) -> None:
     run(["uv", "pip", "install", "-r", str(req_file)], cwd=repo_dir)
 
 
+def install_external_requirements(repo_dir: Path) -> None:
+    """
+    If there are any requirements.txt files in subfolders of external/, install them as well.
+    - Searches recursively under <repo_dir>/external
+    - Installs in deterministic order (sorted by path)
+    - Skips the repo root requirements.txt (handled separately)
+    """
+    external_dir = repo_dir / "external"
+    if not external_dir.exists() or not external_dir.is_dir():
+        info("No external/ folder found; skipping external requirements install.")
+        return
+
+    req_files = sorted(external_dir.rglob("requirements.txt"))
+    if not req_files:
+        info("No external/**/requirements.txt found; skipping external requirements install.")
+        return
+
+    info(f"Installing {len(req_files)} external requirements.txt file(s)...")
+    for req in req_files:
+        info(f"  - {req.relative_to(repo_dir)}")
+        uv_pip_install(repo_dir, req)
+
+
 # ------------------ PyCharm run configurations (.run) -----------------
 
 INSTALL_RUN_TEMPLATE = """<component name="ProjectRunConfigurationManager">
@@ -580,7 +621,6 @@ def generate_pycharm_run_configurations(
     script_name = f"$PROJECT_DIR$/../../odoo/odoo/{odoo_major}/odoo-bin"
     conf_arg = f"-c $PROJECT_DIR$/../{repo_name}.conf"
 
-    # Demo is controlled via config (without_demo), so we do NOT pass demo flags here.
     install_params = f"{conf_arg} --no-http -i {module_to_install} --stop-after-init"
     run_params = f"{conf_arg}"
     unittest_params = (
@@ -630,12 +670,6 @@ def compute_customer_addons_paths(repo_dir: Path) -> List[str]:
 
 
 def upsert_conf_option(conf_text: str, key: str, value: str) -> str:
-    """
-    Ensure an [options] ini-style config contains `key = value`.
-    - If key exists (as `key = ...`), replace it.
-    - Else, insert it right after the [options] header if present.
-    - Else, append [options] section + key at the end.
-    """
     pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*$")
     if pattern.search(conf_text):
         return pattern.sub(f"{key} = {value}", conf_text)
@@ -688,10 +722,6 @@ def create_odoo_conf(
     }
 
     rendered = render_template(tmpl_text, variables)
-
-    # Demo behavior is controlled via config:
-    # - install demo data => without_demo = False
-    # - no demo data      => without_demo = all
     rendered = upsert_conf_option(rendered, "without_demo", "False" if with_demo else "all")
 
     conf_out.write_text(rendered, encoding="utf-8")
@@ -849,7 +879,7 @@ def collect_setup_plan(
     versions: List[str],
     db: bool,
     demo: Optional[bool],
-    module: Optional[str],
+    module: Optional[bool],
     non_interactive: bool,
 ) -> SetupPlan:
     """
@@ -950,8 +980,8 @@ def collect_setup_plan(
         recreate_db=recreate_db,
     )
 
+    # ------------------------------ execution ------------------------------
 
-# ------------------------------ execution ------------------------------
 
 def execute_setup_plan(paths: Paths, plan: SetupPlan) -> None:
     require_cmd("git")
@@ -1020,7 +1050,13 @@ def execute_setup_plan(paths: Paths, plan: SetupPlan) -> None:
     else:
         info("No repo requirements.txt found; skipping.")
 
-    # 10) Create config (includes without_demo based on prompt)
+    # 10) Install external requirements
+    install_external_requirements(repo_dir)
+
+    # 11) Ensure pre-commit hooks
+    ensure_precommit_hooks(repo_dir)
+
+    # 12) Create config (includes without_demo based on prompt)
     conf_path = create_odoo_conf(
         paths=paths,
         repo_dir=repo_dir,
@@ -1034,7 +1070,7 @@ def execute_setup_plan(paths: Paths, plan: SetupPlan) -> None:
         with_demo=plan.with_demo,
     )
 
-    # 11) Optional DB install (no demo flags; config controls demo)
+    # 13) Optional DB install (no demo flags; config controls demo)
     if plan.do_db:
         ensure_pg_role(plan.db_user, plan.db_password, plan.db_host, plan.db_port)
 
@@ -1051,18 +1087,18 @@ def execute_setup_plan(paths: Paths, plan: SetupPlan) -> None:
 
     info(f"Done. Repo: {repo_dir} | Config: {conf_path}")
 
+    # ------------------------------ actions ------------------------------
 
-# ------------------------------ actions ------------------------------
 
 def action_setup(
-    *,
-    paths: Paths,
-    repo_url: Optional[str],
-    versions: List[str],
-    db: bool,
-    demo: Optional[bool],
-    module: Optional[str],
-    non_interactive: bool,
+        *,
+        paths: Paths,
+        repo_url: Optional[str],
+        versions: List[str],
+        db: bool,
+        demo: Optional[bool],
+        module: Optional[str],
+        non_interactive: bool,
 ) -> None:
     plan = collect_setup_plan(
         repo_url=repo_url,
@@ -1111,8 +1147,8 @@ def action_menu(paths: Paths) -> None:
         else:
             warn(f"Invalid choice: {choice}")
 
+    # ------------------------------ click CLI ------------------------------
 
-# ------------------------------ click CLI ------------------------------
 
 def _validate_demo_flags(demo: bool, no_demo: bool) -> None:
     if demo and no_demo:
@@ -1140,13 +1176,13 @@ def cli(ctx: click.Context) -> None:
 @click.option("--module", type=str, required=False)
 @click.option("--non-interactive", is_flag=True)
 def setup_cmd(
-    repo_url: Optional[str],
-    versions: Tuple[str, ...],
-    db: bool,
-    demo: bool,
-    no_demo: bool,
-    module: Optional[str],
-    non_interactive: bool,
+        repo_url: Optional[str],
+        versions: Tuple[str, ...],
+        db: bool,
+        demo: bool,
+        no_demo: bool,
+        module: Optional[str],
+        non_interactive: bool,
 ) -> None:
     paths = ensure_paths()
     _validate_demo_flags(demo, no_demo)
