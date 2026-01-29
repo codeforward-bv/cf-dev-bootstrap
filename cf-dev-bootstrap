@@ -48,6 +48,7 @@ DEFAULT_DB_PASSWORD = "odoo"
 DEFAULT_ADMIN_PASSWD = "admin"
 
 DEFAULT_INSTALL_MODULE = "xx_all"
+DEFAULT_BRANCH = "main"
 
 # Optional customer addon subfolders (included only if they exist)
 CUSTOMER_ADDON_SUBFOLDERS = [
@@ -71,6 +72,163 @@ ASSET_DIR = Path(
 
 # Critical: force remote tracking branches to be populated
 GIT_ORIGIN_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+
+BANNER_LINES = [
+    " ██████╗ ██╗      ██████╗ ██████╗ ██████╗ ███████╗███████╗ ██████╗ ██████╗ ██╗    ██╗ █████╗ ██████╗ ██████╗ ",
+    "██╔════╝ ╚██╗    ██╔════╝██╔═══██╗██╔══██╗██╔════╝██╔════╝██╔═══██╗██╔══██╗██║    ██║██╔══██╗██╔══██╗██╔══██╗",
+    "██║       ╚██╗   ██║     ██║   ██║██║  ██║█████╗  █████╗  ██║   ██║██████╔╝██║ █╗ ██║███████║██████╔╝██║  ██║",
+    "██║       ██╔╝   ██║     ██║   ██║██║  ██║██╔══╝  ██╔══╝  ██║   ██║██╔══██╗██║███╗██║██╔══██║██╔══██╗██║  ██║",
+    "╚██████╗ ██╔╝    ╚██████╗╚██████╔╝██████╔╝███████╗██║     ╚██████╔╝██║  ██║╚███╔███╔╝██║  ██║██║  ██║██████╔╝",
+    " ╚═════╝ ╚═╝      ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ",
+    "                                             cf-dev-bootstrap                                                ",
+]
+
+# ANSI color codes - Codeforward brand colors
+RESET = "\033[0m"
+TEAL = "\033[38;5;37m"       # Teal
+WHITE = "\033[38;5;255m"     # Bright white
+
+# Chevron position in the logo (column indices for each row)
+CHEVRON_COLS = [
+    (9, 12),   # Line 0: ██╗
+    (9, 13),   # Line 1: ╚██╗
+    (10, 14),  # Line 2:  ╚██╗
+    (10, 14),  # Line 3:  ██╔╝
+    (9, 13),   # Line 4: ██╔╝
+    (9, 12),   # Line 5: ╚═╝
+    None,      # Line 6: cf-dev-bootstrap (no chevron)
+]
+
+
+def animate_banner(menu_lines: List[str] = None) -> None:
+    """Display banner with fade-in and Knight Rider scanning effect.
+
+    If menu_lines provided, displays menu below banner during animation.
+    """
+    import shutil
+
+    # Check if terminal supports colors
+    try:
+        supports_color = sys.stdout.isatty()
+    except Exception:
+        supports_color = False
+
+    banner_height = len(BANNER_LINES)
+    banner_width = max(len(line) for line in BANNER_LINES)
+    menu_height = len(menu_lines) if menu_lines else 0
+    total_height = banner_height + menu_height
+
+    if not supports_color:
+        # No animation, just print in teal
+        for line in BANNER_LINES:
+            click.echo(f"{TEAL}{line}{RESET}")
+        if menu_lines:
+            for line in menu_lines:
+                click.echo(line)
+        return
+
+    def move_cursor_up(n: int) -> None:
+        if n > 0:
+            sys.stdout.write(f"\033[{n}A")
+
+    def print_frame(banner_content: List[str]) -> None:
+        """Print banner and menu as single frame."""
+        for line in banner_content:
+            sys.stdout.write(f"{line}{RESET}\n")
+        if menu_lines:
+            for line in menu_lines:
+                sys.stdout.write(f"{line}\n")
+        sys.stdout.flush()
+
+    def make_fade_banner(fade_level: int) -> List[str]:
+        """Generate banner lines with teal fade, white chevron."""
+        teal_shades = [23, 29, 30, 31, 35, 36, 37, 43, 44, 51]
+        white_shades = [240, 244, 247, 249, 251, 252, 253, 254, 255, 255]
+        shade_idx = min(fade_level, len(teal_shades) - 1)
+        teal_color = f"\033[38;5;{teal_shades[shade_idx]}m"
+        white_color = f"\033[38;5;{white_shades[shade_idx]}m"
+
+        result = []
+        for row_idx, line in enumerate(BANNER_LINES):
+            chevron_range = CHEVRON_COLS[row_idx] if row_idx < len(CHEVRON_COLS) else None
+            if chevron_range:
+                colored_line = ""
+                for i, char in enumerate(line):
+                    if chevron_range[0] <= i < chevron_range[1]:
+                        colored_line += f"{white_color}{char}"
+                    else:
+                        colored_line += f"{teal_color}{char}"
+                result.append(colored_line)
+            else:
+                result.append(f"{teal_color}{line}")
+        return result
+
+    def make_knight_rider_banner(highlight_pos: int) -> List[str]:
+        """Generate banner lines with white highlight, chevron always white."""
+        gradient = [TEAL, "\033[38;5;44m", "\033[38;5;51m", WHITE, "\033[38;5;51m", "\033[38;5;44m", TEAL]
+        gradient_width = len(gradient)
+        result = []
+        for row_idx, line in enumerate(BANNER_LINES):
+            chevron_range = CHEVRON_COLS[row_idx] if row_idx < len(CHEVRON_COLS) else None
+            colored_line = ""
+            for i, char in enumerate(line):
+                # Chevron is always white
+                if chevron_range and chevron_range[0] <= i < chevron_range[1]:
+                    colored_line += f"{WHITE}{char}"
+                else:
+                    dist = abs(i - highlight_pos)
+                    if dist < gradient_width:
+                        color = gradient[dist]
+                    else:
+                        color = TEAL
+                    colored_line += f"{color}{char}"
+            result.append(colored_line)
+        return result
+
+    # Phase 1: Fade in teal (10 stages, 0.5 seconds total)
+    for fade_level in range(10):
+        banner = make_fade_banner(fade_level)
+        print_frame(banner)
+        time.sleep(0.05)  # 10 stages * 0.05s = 0.5 seconds
+        if fade_level < 9:
+            move_cursor_up(total_height)
+
+    # Phase 2: Knight Rider sweep in white (0.5 seconds, 1 sweep)
+    steps_per_sweep = banner_width + 14
+    step_size = 2
+    num_steps = steps_per_sweep // step_size
+    delay_per_step = 0.25 / num_steps  # 0.25 seconds per half-sweep = 0.5 seconds for 1 full sweep
+
+    # Left to right
+    for pos in range(0, banner_width + 7, step_size):
+        move_cursor_up(total_height)
+        banner = make_knight_rider_banner(pos)
+        print_frame(banner)
+        time.sleep(delay_per_step)
+
+    # Right to left
+    for pos in range(banner_width + 6, -7, -step_size):
+        move_cursor_up(total_height)
+        banner = make_knight_rider_banner(pos)
+        print_frame(banner)
+        time.sleep(delay_per_step)
+
+    # Final: teal with white chevron
+    move_cursor_up(total_height)
+    final_banner = []
+    for row_idx, line in enumerate(BANNER_LINES):
+        chevron_range = CHEVRON_COLS[row_idx] if row_idx < len(CHEVRON_COLS) else None
+        if chevron_range:
+            colored_line = ""
+            for i, char in enumerate(line):
+                if chevron_range[0] <= i < chevron_range[1]:
+                    colored_line += f"{WHITE}{char}"
+                else:
+                    colored_line += f"{TEAL}{char}"
+            final_banner.append(colored_line)
+        else:
+            final_banner.append(f"{TEAL}{line}")
+    print_frame(final_banner)
 
 
 # ------------------------------ models -------------------------------
@@ -979,9 +1137,9 @@ def collect_setup_plan(
 
     # Prompt for branch in interactive mode if not provided
     if branch is None and not non_interactive:
-        branch = prompt_str("Branch to checkout (leave empty for default)")
-        if not branch:
-            branch = None
+        branch = prompt_str("Branch to checkout", DEFAULT_BRANCH)
+    elif branch is None and non_interactive:
+        branch = DEFAULT_BRANCH
 
     derived_db_name = derive_db_name_from_repo_url(repo_url)
 
@@ -1227,18 +1385,37 @@ def action_update(paths: Paths) -> None:
 
 
 def action_menu(paths: Paths) -> None:
-    while True:
-        click.echo("")
-        click.echo("Codeforward Dev Environment Manager (cf-dev-bootstrap)")
-        click.echo(f"Workspace root: {paths.root}")
-        click.echo("")
-        click.echo("Choose an action:")
-        click.echo("  1) Setup customer dev environment")
-        click.echo("  2) Update Odoo worktrees")
-        click.echo("  3) Add Odoo worktree for specific version")
-        click.echo("  4) Exit")
-        click.echo("")
+    click.echo()  # blank line before banner
 
+    # Build menu content
+    menu_lines = [
+        "",
+        f"Workspace root: {paths.root}",
+        "",
+        "Choose an action:",
+        "  1) Setup customer dev environment",
+        "  2) Update Odoo worktrees",
+        "  3) Add Odoo worktree for specific version",
+        "  4) Exit",
+        "",
+    ]
+
+    # Run animation with menu displayed below
+    animate_banner(menu_lines=menu_lines)
+
+    first_run = True
+    while True:
+        if not first_run:
+            # Reprint menu after an action
+            click.echo("")
+            click.echo("Choose an action:")
+            click.echo("  1) Setup customer dev environment")
+            click.echo("  2) Update Odoo worktrees")
+            click.echo("  3) Add Odoo worktree for specific version")
+            click.echo("  4) Exit")
+            click.echo("")
+
+        first_run = False
         choice = prompt_str("Enter choice (1-4)")
         if choice == "1":
             action_setup(
@@ -1261,6 +1438,14 @@ def action_menu(paths: Paths) -> None:
             add_odoo_worktree(paths, version, retries=1)
             info(f"Done. Worktrees ensured for version {version}.")
         elif choice == "4":
+            # Clear banner and menu before exit
+            if sys.stdout.isatty():
+                total_lines = len(BANNER_LINES) + len(menu_lines) + 2  # +2 for prompt line and blank
+                sys.stdout.write(f"\033[{total_lines}A")  # Move cursor up
+                for _ in range(total_lines):
+                    sys.stdout.write("\033[2K\n")  # Clear each line
+                sys.stdout.write(f"\033[{total_lines}A")  # Move back up
+                sys.stdout.flush()
             return
         else:
             warn(f"Invalid choice: {choice}")
