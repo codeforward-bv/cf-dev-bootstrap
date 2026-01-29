@@ -91,6 +91,7 @@ class Paths:
 @dataclass
 class SetupPlan:
     repo_url: str
+    branch: Optional[str]  # Branch to checkout after cloning
 
     repo_dir: Optional[Path]
     odoo_major: Optional[str]
@@ -502,17 +503,27 @@ def add_odoo_worktree(paths: Paths, version: str, retries: int = 1) -> None:
 
 # ------------------------- customer repo setup -----------------------
 
-def clone_customer_repo(root: Path, url: str) -> Path:
+def clone_customer_repo(root: Path, url: str, branch: Optional[str] = None) -> Path:
     require_cmd("git")
     subpath = derive_repo_subpath_from_url(url)
     target = root / subpath
     target.parent.mkdir(parents=True, exist_ok=True)
 
     if target.exists():
+        # If branch specified and repo exists, checkout the branch
+        if branch:
+            info(f"Checking out branch: {branch}")
+            run(["git", "checkout", branch], cwd=target)
         return target
 
     info(f"Cloning customer repo -> {target}")
     run(["git", "clone", url, str(target)])
+
+    # After clone, checkout specified branch if provided
+    if branch:
+        info(f"Checking out branch: {branch}")
+        run(["git", "checkout", branch], cwd=target)
+
     return target
 
 
@@ -940,6 +951,7 @@ def install_database(
 def collect_setup_plan(
     *,
     repo_url: Optional[str],
+    branch: Optional[str],
     versions: List[str],
     db: bool,
     demo: Optional[bool],
@@ -964,6 +976,12 @@ def collect_setup_plan(
         repo_url = prompt_str("Enter customer repo clone URL (SSH/HTTPS)")
         if not repo_url:
             die("Repo URL is required.")
+
+    # Prompt for branch in interactive mode if not provided
+    if branch is None and not non_interactive:
+        branch = prompt_str("Branch to checkout (leave empty for default)")
+        if not branch:
+            branch = None
 
     derived_db_name = derive_db_name_from_repo_url(repo_url)
 
@@ -1027,6 +1045,7 @@ def collect_setup_plan(
 
     return SetupPlan(
         repo_url=repo_url,
+        branch=branch,
         repo_dir=None,
         odoo_major=None,
         python_version=None,
@@ -1057,7 +1076,7 @@ def execute_setup_plan(paths: Paths, plan: SetupPlan) -> None:
         drop_and_create_db(plan.db_name, plan.db_host, plan.db_port, plan.db_user, plan.db_password)
 
     # 1) Clone customer repo
-    repo_dir = clone_customer_repo(paths.root, plan.repo_url)
+    repo_dir = clone_customer_repo(paths.root, plan.repo_url, plan.branch)
     plan.repo_dir = repo_dir
 
     if repo_dir.name != plan.db_name:
@@ -1158,6 +1177,7 @@ def action_setup(
         *,
         paths: Paths,
         repo_url: Optional[str],
+        branch: Optional[str],
         versions: List[str],
         db: bool,
         demo: Optional[bool],
@@ -1166,6 +1186,7 @@ def action_setup(
 ) -> None:
     plan = collect_setup_plan(
         repo_url=repo_url,
+        branch=branch,
         versions=versions,
         db=db,
         demo=demo,
@@ -1223,6 +1244,7 @@ def action_menu(paths: Paths) -> None:
             action_setup(
                 paths=paths,
                 repo_url=None,
+                branch=None,
                 versions=DEFAULT_ODOO_VERSIONS,
                 db=False,
                 demo=None,
@@ -1266,6 +1288,7 @@ def cli(ctx: click.Context) -> None:
 
 @cli.command("setup")
 @click.option("--repo", "repo_url", type=str, required=False)
+@click.option("--branch", type=str, required=False, help="Branch to checkout after cloning")
 @click.option("--versions", multiple=True, default=DEFAULT_ODOO_VERSIONS, show_default=True)
 @click.option("--db", is_flag=True)
 @click.option("--demo", is_flag=True)
@@ -1274,6 +1297,7 @@ def cli(ctx: click.Context) -> None:
 @click.option("--non-interactive", is_flag=True)
 def setup_cmd(
         repo_url: Optional[str],
+        branch: Optional[str],
         versions: Tuple[str, ...],
         db: bool,
         demo: bool,
@@ -1293,6 +1317,7 @@ def setup_cmd(
     action_setup(
         paths=paths,
         repo_url=repo_url,
+        branch=branch,
         versions=list(versions),
         db=db,
         demo=demo_value,
